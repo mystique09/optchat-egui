@@ -1,7 +1,12 @@
+pub mod attachments;
 pub mod credentials;
+pub mod integrations;
+pub mod local_tools;
 pub mod memory;
 pub mod model;
+pub mod oauth;
 pub mod runtime;
+pub mod skills;
 
 pub const NODE: usize = 512;
 pub const VIEW: usize = 128_000;
