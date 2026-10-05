@@ -12,6 +12,378 @@ use std::{
 };
 use tokio::sync::mpsc;
 
+#[tokio::test]
+async fn attachments_reach_provider_as_images_and_text() {
+    for provider in [Provider::Anthropic, Provider::DeepSeek] {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("image.png");
+        image::RgbImage::new(2, 2).save(&image).unwrap();
+        let log = dir.path().join("input.log");
+        std::fs::write(&log, "ERROR: connection refused").unwrap();
+        let (endpoint, requests, server) =
+            server(vec![vec![json!({"type":"text","text":"Analyzed."})]]);
+        let (tx, rx) = mpsc::unbounded_channel();
+        let (ev, mut events) = mpsc::unbounded_channel();
+        let task = tokio::spawn(runtime::run(
+            Settings {
+                integrations_path: None,
+                provider,
+                directory: dir.path().into(),
+                master: "fixture".into(),
+                compactor: "fixture-compactor".into(),
+                instructions: String::new(),
+                key: "fixture".into(),
+                endpoint,
+            },
+            rx,
+            ev,
+        ));
+        tx.send(Command::SendFiles {
+            text: "Analyze these".into(),
+            paths: vec![image, log],
+        })
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(event) = events.recv().await {
+                match event {
+                    Event::Idle => break,
+                    Event::Error(e) => panic!("{e}"),
+                    Event::AttachmentRejected { error, .. } => panic!("{error}"),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        tx.send(Command::Shutdown).unwrap();
+        task.await.unwrap();
+        server.join().unwrap();
+        let requests = requests.lock().unwrap();
+        let request = requests.iter().find(|r| r["model"] == "fixture").unwrap();
+        let blocks = request["messages"][0]["content"].as_array().unwrap();
+        assert!(
+            blocks
+                .iter()
+                .any(|b| b["type"] == "image" && b["source"]["media_type"] == "image/png")
+        );
+        assert!(
+            blocks
+                .iter()
+                .any(|b| b["text"] == "ERROR: connection refused")
+        );
+    }
+}
+
+#[tokio::test]
+async fn local_tool_config_edits_reload_before_next_model_step() {
+    use optchat::integrations::{Config, Server};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("integrations.json");
+    let base = Config {
+        skill_directories: vec![],
+        ..Config::default()
+    };
+    base.save(&path).await.unwrap();
+    let mut edited = base.clone();
+    edited.servers.insert(
+        "added".into(),
+        Server::Stdio {
+            command: "python3".into(),
+            args: vec![
+                format!(
+                    "{}/tests/fixtures/mcp_server.py",
+                    env!("CARGO_MANIFEST_DIR")
+                ),
+                "stdio".into(),
+                dir.path().join("mcp.log").display().to_string(),
+                "added".into(),
+            ],
+            cwd: None,
+            env_from: Default::default(),
+        },
+    );
+    let (endpoint, requests, server) = server(vec![
+        vec![
+            json!({"type":"tool_use","id":"edit","name":"write_file","input":{"path":path,"content":serde_json::to_string(&edited).unwrap(),"overwrite":true}}),
+        ],
+        vec![json!({"type":"text","text":"Configuration loaded."})],
+    ]);
+    let (tx, rx) = mpsc::unbounded_channel();
+    let (ev, mut events) = mpsc::unbounded_channel();
+    let task = tokio::spawn(runtime::run(
+        Settings {
+            integrations_path: Some(path.clone()),
+            provider: Provider::Anthropic,
+            directory: dir.path().into(),
+            master: "fixture".into(),
+            compactor: "fixture-compactor".into(),
+            instructions: String::new(),
+            key: "fixture".into(),
+            endpoint,
+        },
+        rx,
+        ev,
+    ));
+    tx.send(Command::Send("Add a server".into())).unwrap();
+    let mut loaded = false;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while let Some(event) = events.recv().await {
+            match event {
+                Event::Approval(approval) => {
+                    approval.answer.send(true).unwrap();
+                }
+                Event::Integrations { config, .. } => {
+                    loaded |= Config::parse(&config)
+                        .unwrap()
+                        .servers
+                        .contains_key("added");
+                }
+                Event::Idle => break,
+                Event::Error(e) => panic!("{e}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    tx.send(Command::Shutdown).unwrap();
+    task.await.unwrap();
+    server.join().unwrap();
+    assert!(loaded);
+    assert!(
+        Config::load(&path)
+            .await
+            .unwrap()
+            .servers
+            .contains_key("added")
+    );
+    let requests = requests.lock().unwrap();
+    let master: Vec<_> = requests
+        .iter()
+        .filter(|r| r["model"] == "fixture")
+        .collect();
+    assert_eq!(master.len(), 2);
+    assert!(master[1]["tools"].as_array().unwrap().iter().any(|t| {
+        t["description"]
+            .as_str()
+            .unwrap_or("")
+            .starts_with("MCP server added,")
+    }));
+}
+
+#[tokio::test]
+async fn skills_and_mcp_complete_a_model_turn_with_durable_results() {
+    check_mcp_permissions(false).await;
+}
+
+#[tokio::test]
+async fn full_access_executes_without_prompt_and_can_return_to_ask() {
+    check_mcp_permissions(true).await;
+}
+
+async fn check_mcp_permissions(full_access: bool) {
+    use optchat::integrations::{Config, Integrations, Server};
+    let dir = tempfile::tempdir().unwrap();
+    let skill_dir = dir.path().join("skill");
+    std::fs::create_dir(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: fixture\ndescription: Test skill\n---\nUse the echo tool.",
+    )
+    .unwrap();
+    let log = dir.path().join("mcp.log");
+    let config = Config {
+        skill_directories: vec![skill_dir.clone()],
+        servers: std::collections::BTreeMap::from([(
+            "fixture".into(),
+            Server::Stdio {
+                command: "python3".into(),
+                args: vec![
+                    format!(
+                        "{}/tests/fixtures/mcp_server.py",
+                        env!("CARGO_MANIFEST_DIR")
+                    ),
+                    "stdio".into(),
+                    log.display().to_string(),
+                    "runtime".into(),
+                ],
+                cwd: None,
+                env_from: Default::default(),
+            },
+        )]),
+        timeout_seconds: 3,
+    };
+    let integration = Integrations::connect(config.clone()).await;
+    let alias = integration
+        .definitions
+        .iter()
+        .find(|d| {
+            d["description"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("MCP server fixture, tool echo.")
+        })
+        .unwrap()["name"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let skill_id = integration.skills[0].id.clone();
+    drop(integration);
+    let config_path = dir.path().join("integrations.json");
+    config.save(&config_path).await.unwrap();
+    let (endpoint, requests, server) = server(vec![
+        vec![json!({"type":"tool_use","id":"skill","name":"load_skill","input":{"id":skill_id}})],
+        vec![json!({"type":"tool_use","id":"mcp","name":alias,"input":{"value":"worked"}})],
+        vec![json!({"type":"text","text":"Completed the skill with the MCP tool."})],
+        vec![
+            json!({"type":"tool_use","id":"cancel-me","name":alias,"input":{"value":"never-execute"}}),
+        ],
+        vec![json!({"type":"text","text":"A fresh turn after cancellation."})],
+    ]);
+    let (tx, rx) = mpsc::unbounded_channel();
+    let (ev, mut events) = mpsc::unbounded_channel();
+    let task = tokio::spawn(runtime::run(
+        Settings {
+            provider: Provider::DeepSeek,
+            directory: dir.path().into(),
+            master: "fixture".into(),
+            compactor: "fixture-compactor".into(),
+            instructions: String::new(),
+            key: "fixture".into(),
+            endpoint,
+            integrations_path: Some(config_path.clone()),
+        },
+        rx,
+        ev,
+    ));
+    if full_access {
+        tx.send(Command::Permissions(runtime::Permissions::FullAccess))
+            .unwrap();
+    }
+    tx.send(Command::Send("Use the fixture skill".into()))
+        .unwrap();
+    let mut approvals = 0;
+    let mut pending_approval = None;
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while let Some(event) = events.recv().await {
+            match event {
+                Event::Approval(approval) => {
+                    assert!(!full_access, "Full access must not emit approval prompts");
+                    assert_eq!(approval.server, "fixture");
+                    assert_eq!(approval.arguments["value"], "worked");
+                    approvals += 1;
+                    tx.send(Command::Send("Also keep this mid-run instruction".into()))
+                        .unwrap();
+                    pending_approval = Some(approval);
+                }
+                Event::Status(status) if status.contains("queued for the next tool boundary") => {
+                    pending_approval.take().unwrap().answer.send(true).unwrap();
+                }
+                Event::Idle => break,
+                Event::Error(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(approvals, usize::from(!full_access));
+    assert_eq!(
+        runtime::Permissions::load(dir.path()).await.unwrap(),
+        if full_access {
+            runtime::Permissions::FullAccess
+        } else {
+            runtime::Permissions::Ask
+        }
+    );
+    tx.send(Command::Permissions(runtime::Permissions::Ask))
+        .unwrap();
+    tx.send(Command::ReloadIntegrations {
+        config: "invalid JSON".into(),
+        base: "{}".into(),
+    })
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while let Some(event) = events.recv().await {
+            if matches!(event, Event::Error(_)) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        Config::load(&config_path)
+            .await
+            .unwrap()
+            .servers
+            .contains_key("fixture")
+    );
+    tx.send(Command::Send("Try another call".into())).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(event) = events.recv().await {
+            match event {
+                Event::Approval(approval) => {
+                    assert_eq!(approval.arguments["value"], "never-execute");
+                    tx.send(Command::Cancel).unwrap();
+                    pending_approval = Some(approval);
+                }
+                Event::Idle => break,
+                Event::Error(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+    })
+    .await
+    .unwrap();
+    tx.send(Command::Send("Start fresh".into())).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while let Some(event) = events.recv().await {
+            if matches!(event, Event::Idle) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(pending_approval.take().unwrap().answer.is_closed());
+    tx.send(Command::Shutdown).unwrap();
+    task.await.unwrap();
+    server.join().unwrap();
+    let store = optchat::memory::Store::open(dir.path()).await.unwrap();
+    assert!(
+        store
+            .memory
+            .root
+            .iter()
+            .any(|m| m.kind == Kind::Echo && m.text.contains("Use the echo tool."))
+    );
+    assert!(
+        store
+            .memory
+            .root
+            .iter()
+            .any(|m| m.kind == Kind::Echo && m.text.contains("runtime:worked"))
+    );
+    let requests = requests.lock().unwrap();
+    let master: Vec<_> = requests
+        .iter()
+        .filter(|r| r["model"] == "fixture")
+        .collect();
+    assert_eq!(master.len(), 5);
+    assert_eq!(master[0]["tools"], master[2]["tools"]);
+    assert!(master[2]["messages"].to_string().contains("runtime:worked"));
+    assert_eq!(
+        master[2]["messages"]
+            .to_string()
+            .contains("Also keep this mid-run instruction"),
+        !full_access
+    );
+    assert_eq!(master[4]["messages"].as_array().unwrap().len(), 1);
+    let calls = std::fs::read_to_string(log).unwrap();
+    assert!(!calls.contains("never-execute"));
+}
+
 fn server(
     replies: Vec<Vec<Value>>,
 ) -> (String, Arc<Mutex<Vec<Value>>>, std::thread::JoinHandle<()>) {
@@ -20,7 +392,8 @@ fn server(
     let requests = Arc::new(Mutex::new(vec![]));
     let seen = requests.clone();
     let handle = std::thread::spawn(move || {
-        for blocks in replies {
+        let mut replies = std::collections::VecDeque::from(replies);
+        while !replies.is_empty() {
             let (mut socket, _) = listener.accept().unwrap();
             socket
                 .set_read_timeout(Some(Duration::from_secs(10)))
@@ -49,9 +422,15 @@ fn server(
                 assert!(n > 0);
                 data.extend_from_slice(&buf[..n]);
             }
-            seen.lock()
-                .unwrap()
-                .push(serde_json::from_slice(&data[head..head + len]).unwrap());
+            let request: Value = serde_json::from_slice(&data[head..head + len]).unwrap();
+            let blocks = if request["model"] == "fixture-compactor" {
+                vec![
+                    json!({"type":"text","text":"user: integration test; echo: tool returned a result."}),
+                ]
+            } else {
+                replies.pop_front().unwrap()
+            };
+            seen.lock().unwrap().push(request);
             let mut events = vec![
                 json!({"type":"message_start","message":{"usage":{"input_tokens":100,"cache_read_input_tokens":50}}}),
             ];
@@ -125,6 +504,7 @@ async fn check_turn_loop(provider: Provider) {
     let (ev, mut events) = mpsc::unbounded_channel();
     let task = tokio::spawn(runtime::run(
         Settings {
+            integrations_path: None,
             provider,
             directory: dir.path().into(),
             master: "fixture".into(),
@@ -234,6 +614,17 @@ async fn check_compactor(provider: Provider) {
     assert_eq!(result.len(), 526);
     server.join().unwrap();
     let requests = requests.lock().unwrap();
+    for request in requests.iter() {
+        if provider == Provider::DeepSeek {
+            assert_eq!(request["max_tokens"], 384_000);
+            assert_eq!(request["thinking"]["type"], "enabled");
+            assert_eq!(request["output_config"]["effort"], "high");
+        } else {
+            assert_eq!(request["max_tokens"], 32_768);
+            assert_eq!(request["thinking"]["type"], "adaptive");
+            assert_eq!(request["output_config"]["effort"], "medium");
+        }
+    }
     assert_eq!(requests[4]["messages"].as_array().unwrap().len(), 9);
     assert!(
         requests[1]["messages"][2]["content"]
@@ -261,6 +652,7 @@ async fn cancel_while_waiting_keeps_user_input() {
     let (ev, mut events) = mpsc::unbounded_channel();
     let task = tokio::spawn(runtime::run(
         Settings {
+            integrations_path: None,
             provider: Provider::Anthropic,
             directory: dir.path().into(),
             master: "fixture".into(),
@@ -397,6 +789,7 @@ async fn provider_cannot_change_while_a_turn_waits_for_memory() {
     let (ev, mut events) = mpsc::unbounded_channel();
     let task = tokio::spawn(runtime::run(
         Settings {
+            integrations_path: None,
             provider: Provider::Anthropic,
             directory: dir.path().into(),
             master: "fixture".into(),

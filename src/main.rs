@@ -8,21 +8,41 @@ use std::{path::PathBuf, time::Duration};
 use tokio::sync::mpsc;
 
 fn main() -> eframe::Result {
-    let provider = match Provider::parse(
-        &std::env::var("OPTCHAT_PROVIDER").unwrap_or_else(|_| "anthropic".into()),
-    ) {
+    let directory = std::env::var_os("OPTCHAT_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("chat"));
+    let rt = tokio::runtime::Runtime::new().expect("Tokio runtime");
+    let (saved, mut errors) = match rt.block_on(runtime::ModelSelection::load(&directory)) {
+        Ok(saved) => (saved, vec![]),
+        Err(error) => (
+            None,
+            vec![format!("Could not load model settings: {error}")],
+        ),
+    };
+    let provider = match Provider::parse(&std::env::var("OPTCHAT_PROVIDER").unwrap_or_else(|_| {
+        saved
+            .as_ref()
+            .map_or(Provider::Anthropic, |s| s.provider)
+            .label()
+            .to_lowercase()
+    })) {
         Ok(provider) => provider,
         Err(error) => {
             eprintln!("{error}");
             std::process::exit(2);
         }
     };
-    let directory = std::env::var_os("OPTCHAT_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("chat"));
-    let master = std::env::var("OPTCHAT_MODEL").unwrap_or_else(|_| provider.default_model().into());
-    let compactor =
-        std::env::var("OPTCHAT_COMPACTOR").unwrap_or_else(|_| provider.default_model().into());
+    let saved = saved.filter(|s| s.provider == provider);
+    let master = std::env::var("OPTCHAT_MODEL").unwrap_or_else(|_| {
+        saved
+            .as_ref()
+            .map_or_else(|| provider.default_model().into(), |s| s.master.clone())
+    });
+    let compactor = std::env::var("OPTCHAT_COMPACTOR").unwrap_or_else(|_| {
+        saved
+            .as_ref()
+            .map_or_else(|| provider.default_model().into(), |s| s.compactor.clone())
+    });
     let instructions_path = std::env::var_os("OPTCHAT_INSTRUCTIONS")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("AGENTS.md"));
@@ -34,16 +54,16 @@ fn main() -> eframe::Result {
             return Ok(());
         }
     };
-    let rt = tokio::runtime::Runtime::new().expect("Tokio runtime");
-    let (key, errors) = match rt.block_on(optchat::credentials::load(provider)) {
-        Ok(key) => (key, vec![]),
-        Err(error) => (
-            std::env::var(provider.key_variable()).unwrap_or_default(),
-            vec![error.to_string()],
-        ),
+    let key = match rt.block_on(optchat::credentials::load(provider)) {
+        Ok(key) => key,
+        Err(error) => {
+            errors.push(error.to_string());
+            std::env::var(provider.key_variable()).unwrap_or_default()
+        }
     };
     let connected = !key.trim().is_empty();
     let settings = Settings {
+        integrations_path: Some(directory.join("integrations.json")),
         provider,
         directory: directory.clone(),
         master: master.clone(),
@@ -66,15 +86,42 @@ fn main() -> eframe::Result {
         },
         Box::new(move |cc| {
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
+            cc.egui_ctx.style_mut_of(egui::Theme::Dark, |style| {
+                style
+                    .text_styles
+                    .insert(egui::TextStyle::Body, egui::FontId::proportional(18.0));
+                style
+                    .text_styles
+                    .insert(egui::TextStyle::Button, egui::FontId::proportional(16.0));
+                style
+                    .text_styles
+                    .insert(egui::TextStyle::Monospace, egui::FontId::monospace(16.0));
+                style
+                    .text_styles
+                    .insert(egui::TextStyle::Heading, egui::FontId::proportional(26.0));
+            });
             Ok(Box::new(App {
                 tx,
                 rx: event_rx,
                 memory: Memory::default(),
                 draft: String::new(),
+                attachments: Vec::new(),
+                markdown_cache: egui_commonmark::CommonMarkCache::default(),
                 status: "Opening memory…".into(),
                 errors,
                 api_key: String::new(),
                 saving_settings: false,
+                permissions: runtime::Permissions::Ask,
+                permissions_open: false,
+                integration_config: optchat::integrations::Config::default(),
+                integration_base: optchat::integrations::Config::default(),
+                integration_saving: false,
+                new_server: String::new(),
+                new_skill_directory: String::new(),
+                integration_status: vec!["Discovering integrations…".into()],
+                approval: None,
+                oauth_busy: false,
+                oauth_url: None,
                 streaming: String::new(),
                 thoughts: String::new(),
                 usage: String::new(),
@@ -108,6 +155,8 @@ struct App {
     rx: mpsc::UnboundedReceiver<Event>,
     memory: Memory,
     draft: String,
+    attachments: Vec<PathBuf>,
+    markdown_cache: egui_commonmark::CommonMarkCache,
     status: String,
     errors: Vec<String>,
     streaming: String,
@@ -126,17 +175,41 @@ struct App {
     import_path: String,
     api_key: String,
     saving_settings: bool,
+    permissions: runtime::Permissions,
+    permissions_open: bool,
+    integration_config: optchat::integrations::Config,
+    integration_base: optchat::integrations::Config,
+    integration_saving: bool,
+    new_server: String,
+    new_skill_directory: String,
+    integration_status: Vec<String>,
+    approval: Option<optchat::integrations::Approval>,
+    oauth_busy: bool,
+    oauth_url: Option<String>,
 }
 impl App {
     fn send(&mut self) {
+        if self.draft.trim() == "/permissions" {
+            self.draft.clear();
+            self.permissions_open = true;
+            return;
+        }
         if self.saving_settings {
             return;
         }
-        if self.draft.trim().is_empty() {
+        if self.draft.trim().is_empty() && self.attachments.is_empty() {
             return;
         }
         let text = std::mem::take(&mut self.draft);
-        if self.tx.send(Command::Send(text)).is_err() {
+        let command = if self.attachments.is_empty() {
+            Command::Send(text)
+        } else {
+            Command::SendFiles {
+                text,
+                paths: std::mem::take(&mut self.attachments),
+            }
+        };
+        if self.tx.send(command).is_err() {
             self.errors
                 .push("Memory worker is unavailable; restart the app.".into());
         } else {
@@ -146,6 +219,55 @@ impl App {
     fn receive(&mut self) {
         while let Ok(event) = self.rx.try_recv() {
             match event {
+                Event::AttachmentRejected {
+                    text,
+                    paths,
+                    error,
+                    active,
+                } => {
+                    if !self.draft.is_empty() {
+                        self.draft.push_str("\n\n");
+                    }
+                    self.draft.push_str(&text);
+                    self.attachments.extend(paths);
+                    self.errors.push(error);
+                    self.active = active;
+                }
+                Event::OAuthBusy(busy) => self.oauth_busy = busy,
+                Event::OAuthUrl(url) => self.oauth_url = Some(url),
+                Event::SummaryRecovered(part) => {
+                    let prefix = format!("Summary {}:", part.address());
+                    self.errors.retain(|error| !error.starts_with(&prefix));
+                }
+                Event::Permissions(mode) => {
+                    self.permissions = mode;
+                    if mode == runtime::Permissions::FullAccess
+                        && let Some(approval) = self.approval.take()
+                    {
+                        let _ = approval.answer.send(true);
+                    }
+                }
+                Event::Integrations { config, status } => {
+                    if let Ok(config) = optchat::integrations::Config::parse(&config)
+                        && (self.integration_saving
+                            || serde_json::to_value(&self.integration_config).ok()
+                                == serde_json::to_value(&self.integration_base).ok())
+                    {
+                        self.integration_config = config.clone();
+                        self.integration_base = config;
+                    }
+                    self.integration_status = status;
+                    self.integration_saving = false;
+                }
+                Event::Approval(approval) => {
+                    if !approval.answer.is_closed() {
+                        if self.permissions == runtime::Permissions::FullAccess {
+                            let _ = approval.answer.send(true);
+                        } else {
+                            self.approval = Some(approval);
+                        }
+                    }
+                }
                 Event::Snapshot(memory) => {
                     if memory.root.len() > self.memory.root.len() {
                         self.streaming.clear();
@@ -161,7 +283,10 @@ impl App {
                     self.status = s;
                 }
                 Event::Error(s) => {
-                    self.errors.push(s);
+                    self.integration_saving = false;
+                    if !self.errors.contains(&s) {
+                        self.errors.push(s);
+                    }
                     if self.errors.len() > 20 {
                         self.errors.remove(0);
                     }
@@ -182,6 +307,7 @@ impl App {
                 }
                 Event::SettingsRejected => self.saving_settings = false,
                 Event::Idle => {
+                    self.approval = None;
                     self.active = false;
                     self.streaming.clear();
                 }
@@ -193,6 +319,19 @@ impl App {
             .resizable(false)
             .show(ui, |ui| {
                 ui.add_space(10.0);
+                ui.weak("Drop images or text/log files here to attach them (up to 8 files).");
+                let mut remove = None;
+                for (index, path) in self.attachments.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.label(path.file_name().unwrap_or_default().to_string_lossy());
+                        if ui.small_button("Remove").clicked() {
+                            remove = Some(index);
+                        }
+                    });
+                }
+                if let Some(index) = remove {
+                    self.attachments.remove(index);
+                }
                 let response = ui.add(
                     egui::TextEdit::multiline(&mut self.draft)
                         .hint_text("Write a message. Your history stays here.")
@@ -204,7 +343,7 @@ impl App {
                 ui.horizontal(|ui| {
                     if ui
                         .add_enabled(
-                            !self.draft.trim().is_empty(),
+                            !self.draft.trim().is_empty() || !self.attachments.is_empty(),
                             egui::Button::new(if self.active {
                                 "Queue message"
                             } else {
@@ -238,12 +377,14 @@ impl App {
                         } else {
                             ui.add_space(16.0);
                             ui.horizontal(|ui| { ui.label(RichText::new(if m.kind==Kind::User { "YOU" } else { "OPTCHAT" }).small().strong().color(if m.kind==Kind::User { Color32::from_rgb(126,204,186) } else { Color32::from_rgb(148,177,227) })); ui.weak(m.date.format("%b %d · %H:%M").to_string()); });
-                            ui.add_space(4.0); ui.add(egui::Label::new(&m.text).wrap().selectable(true)); ui.add_space(12.0); ui.separator();
+                            ui.add_space(4.0);
+                            egui_commonmark::CommonMarkViewer::new().show(ui, &mut self.markdown_cache, &m.text);
+                            ui.add_space(12.0); ui.separator();
                         }
                     });
                 }
                 if !self.thoughts.is_empty() { egui::CollapsingHeader::new("Reasoning · not saved to memory").show(ui,|ui| { ui.add(egui::Label::new(&self.thoughts).wrap()); }); }
-                if !self.streaming.is_empty() { ui.add_space(12.0); ui.add(egui::Label::new(&self.streaming).wrap()); }
+                if !self.streaming.is_empty() { ui.add_space(12.0); ui.push_id("streaming", |ui| { egui_commonmark::CommonMarkViewer::new().show(ui, &mut self.markdown_cache, &self.streaming); }); }
             });
         });
     }
@@ -270,6 +411,79 @@ impl App {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.receive();
+        for file in ui.input(|input| input.raw.dropped_files.clone()) {
+            let path = file.path().to_path_buf();
+            if self.attachments.contains(&path) {
+                continue;
+            }
+            if self.attachments.len() == 8 {
+                let error = "Attach at most 8 files per message.".to_owned();
+                if !self.errors.contains(&error) {
+                    self.errors.push(error);
+                }
+                break;
+            }
+            self.attachments.push(path);
+            self.tab = Tab::Chat;
+        }
+        if let Some(url) = self.oauth_url.take() {
+            ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+        }
+        if self.permissions_open {
+            egui::Window::new("Permissions")
+                .open(&mut self.permissions_open)
+                .collapsible(false)
+                .show(ui.ctx(), |ui| {
+                    ui.label("Choose how OptChat runs local and MCP tools. This choice is saved for future sessions.");
+                    let mut mode = self.permissions;
+                    ui.radio_value(&mut mode, runtime::Permissions::Ask, "Ask for approval");
+                    ui.radio_value(&mut mode, runtime::Permissions::FullAccess, "Full access");
+                    ui.weak("Full access allows shell commands, local file access, and all configured MCP tools without approval, including changes to files and external services.");
+                    if mode != self.permissions { let _ = self.tx.send(Command::Permissions(mode)); }
+                });
+        }
+        if self.approval.as_ref().is_some_and(|a| a.answer.is_closed()) {
+            self.approval = None;
+        }
+        if let Some(approval) = &self.approval {
+            let mut answer = None;
+            egui::Window::new("Allow tool call?")
+                .collapsible(false)
+                .resizable(true)
+                .show(ui.ctx(), |ui| {
+                    ui.label(format!(
+                        "Server: {} · Tool: {}",
+                        approval.server, approval.tool
+                    ));
+                    egui::ScrollArea::vertical()
+                        .max_height(240.0)
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::Label::new(
+                                    serde_json::to_string_pretty(&approval.arguments)
+                                        .unwrap_or_default(),
+                                )
+                                .wrap(),
+                            );
+                        });
+                    ui.horizontal(|ui| {
+                        if ui.button("Allow once").clicked() {
+                            answer = Some(true);
+                        }
+                        if ui.button("Deny").clicked() {
+                            answer = Some(false);
+                        }
+                        if ui.button("Permissions…").clicked() {
+                            self.permissions_open = true;
+                        }
+                    });
+                });
+            if let Some(answer) = answer
+                && let Some(approval) = self.approval.take()
+            {
+                let _ = approval.answer.send(answer);
+            }
+        }
         ui.ctx().request_repaint_after(Duration::from_millis(100));
         egui::Panel::top("header").show(ui, |ui| {
             ui.add_space(8.0);
@@ -279,6 +493,9 @@ impl eframe::App for App {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Settings").clicked() {
                         self.settings = !self.settings;
+                    }
+                    if ui.button("Permissions").clicked() {
+                        self.permissions_open = true;
                     }
                     ui.selectable_value(&mut self.tab, Tab::Memory, "Memory");
                     ui.selectable_value(&mut self.tab, Tab::Chat, "Chat");
@@ -315,6 +532,7 @@ impl eframe::App for App {
         if self.settings {
             egui::Window::new("Settings")
                 .resizable(true)
+                .vscroll(true)
                 .show(ui.ctx(), |ui| {
                     ui.label(format!("Active provider: {}", self.provider.label()));
                     let previous = self.selected_provider;
@@ -405,6 +623,49 @@ impl eframe::App for App {
                             .send(Command::Import(PathBuf::from(&self.import_path)));
                     }
                     ui.weak("Imports append permanently. Reimporting adds another copy.");
+                    ui.separator();
+                    egui::CollapsingHeader::new("MCP and skills").show(ui, |ui| {
+                        let (valid, oauth_action) = ui.add_enabled_ui(!self.oauth_busy && !self.active && !self.integration_saving, |ui| {
+                            integration_editor(ui, &mut self.integration_config, &mut self.new_server, &mut self.new_skill_directory)
+                        }).inner;
+                        if let Some((server, sign_out)) = oauth_action {
+                            match serde_json::to_string(&self.integration_config) {
+                                Ok(config) => {
+                                    let base = serde_json::to_string(&self.integration_base).expect("config serializes");
+                                    self.oauth_busy = self.tx.send(Command::OAuth { config, base, server, sign_out }).is_ok();
+                                    self.integration_saving = self.oauth_busy;
+                                }
+                                Err(error) => self.errors.push(error.to_string()),
+                            }
+                        }
+                        if self.oauth_busy {
+                            ui.label("Waiting for OAuth sign-in / connection… Complete authorization in your browser.");
+                            if ui.button("Cancel sign-in").clicked() { let _ = self.tx.send(Command::CancelOAuth); }
+                        }
+                        if ui
+                            .add_enabled(
+                                !self.active && !self.oauth_busy && !self.integration_saving && valid,
+                                egui::Button::new("Save and reload integrations"),
+                            )
+                            .clicked()
+                        {
+                            match serde_json::to_string(&self.integration_config) {
+                                Ok(config) => {
+                                    let base = serde_json::to_string(&self.integration_base).expect("config serializes");
+                                    let _ = self.tx.send(Command::ReloadIntegrations { config, base });
+                                    self.integration_saving = true;
+                                }
+                                Err(error) => self.errors.push(error.to_string()),
+                            }
+                        }
+                        for status in &self.integration_status {
+                            ui.label(status);
+                        }
+                        if ui.add_enabled(!self.active && !self.oauth_busy, egui::Button::new("Reload from disk (discard Settings edits)")).clicked() {
+                            self.integration_config = self.integration_base.clone();
+                            let _ = self.tx.send(Command::ReloadFromDisk);
+                        }
+                    });
                 });
         }
         match self.tab {
@@ -412,4 +673,237 @@ impl eframe::App for App {
             Tab::Memory => self.memory(ui),
         }
     }
+}
+
+fn integration_editor(
+    ui: &mut egui::Ui,
+    config: &mut optchat::integrations::Config,
+    new_server: &mut String,
+    new_skill_directory: &mut String,
+) -> (bool, Option<(String, bool)>) {
+    use optchat::integrations::Server;
+    let mut valid = true;
+    let mut oauth_action = None;
+    ui.label("MCP servers");
+    ui.weak("Changes apply when saved. Saving starts configured server commands.");
+    let mut remove = None;
+    for (name, server) in &mut config.servers {
+        ui.push_id(name, |ui| {
+            ui.group(|ui| {
+                ui.horizontal(|ui| {
+                    ui.strong(name);
+                    if ui.button("Remove server").clicked() {
+                        remove = Some(name.clone());
+                    }
+                });
+                let was_http = matches!(server, Server::Http { .. });
+                let mut http = was_http;
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut http, false, "Local command (stdio)");
+                    ui.selectable_value(&mut http, true, "Streamable HTTP");
+                });
+                if http != was_http {
+                    *server = if http {
+                        Server::Http {
+                            url: String::new(),
+                            bearer_token_env: None,
+                            oauth: None,
+                        }
+                    } else {
+                        Server::Stdio {
+                            command: String::new(),
+                            args: vec![],
+                            cwd: None,
+                            env_from: Default::default(),
+                        }
+                    };
+                }
+                match server {
+                    Server::Stdio {
+                        command,
+                        args,
+                        cwd,
+                        env_from,
+                    } => {
+                        ui.label("Command");
+                        ui.text_edit_singleline(command);
+                        ui.label("Arguments (one per field; no shell quoting needed)");
+                        let mut removed = None;
+                        for (index, arg) in args.iter_mut().enumerate() {
+                            ui.push_id(index, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.text_edit_singleline(arg);
+                                    if ui.button("Remove argument").clicked() {
+                                        removed = Some(index);
+                                    }
+                                });
+                            });
+                        }
+                        if let Some(index) = removed {
+                            args.remove(index);
+                        }
+                        if ui.button("Add argument").clicked() {
+                            args.push(String::new());
+                        }
+                        ui.label("Working directory (optional)");
+                        let mut directory = cwd
+                            .as_ref()
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .unwrap_or_default();
+                        if ui.text_edit_singleline(&mut directory).changed() {
+                            *cwd = if directory.is_empty() {
+                                None
+                            } else {
+                                Some(directory.into())
+                            };
+                        }
+                        ui.label(
+                            "Environment references: CHILD_VARIABLE=APP_VARIABLE (one per line)",
+                        );
+                        let mut environment = env_from
+                            .iter()
+                            .map(|(key, value)| format!("{key}={value}"))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        // Retain incomplete edits until focus leaves the field.
+                        let id = ui.id().with("environment");
+                        environment = ui
+                            .data_mut(|data| data.get_temp::<String>(id))
+                            .unwrap_or(environment);
+                        let response =
+                            ui.add(egui::TextEdit::multiline(&mut environment).desired_rows(2));
+                        if response.changed() {
+                            ui.data_mut(|data| data.insert_temp(id, environment.clone()));
+                        }
+                        {
+                            let entries: Option<std::collections::BTreeMap<String, String>> =
+                                environment
+                                    .lines()
+                                    .filter(|line| !line.trim().is_empty())
+                                    .map(|line| {
+                                        let (key, value) = line.split_once('=')?;
+                                        if key.trim().is_empty() || value.trim().is_empty() {
+                                            return None;
+                                        }
+                                        Some((key.trim().into(), value.trim().into()))
+                                    })
+                                    .collect();
+                            if let Some(entries) = entries {
+                                *env_from = entries;
+                                if !response.has_focus() {
+                                    ui.data_mut(|data| data.remove::<String>(id));
+                                }
+                            } else {
+                                valid = false;
+                            }
+                        }
+                        if ui.data_mut(|data| data.get_temp::<String>(id)).is_some()
+                            && !response.has_focus()
+                        {
+                            ui.colored_label(
+                                Color32::LIGHT_RED,
+                                "Use CHILD_VARIABLE=APP_VARIABLE for each environment reference.",
+                            );
+                        }
+                    }
+                    Server::Http {
+                        url,
+                        bearer_token_env,
+                        oauth,
+                    } => {
+                        ui.label("Server URL");
+                        ui.text_edit_singleline(url);
+                        let mut use_oauth = oauth.is_some();
+                        if ui.checkbox(&mut use_oauth, "Browser sign-in (OAuth)").changed() {
+                            *oauth = use_oauth.then(Default::default);
+                            if use_oauth { *bearer_token_env = None; }
+                        }
+                        if let Some(oauth) = oauth {
+                            ui.label("Client ID (optional; blank uses dynamic registration)");
+                            ui.text_edit_singleline(&mut oauth.client_id);
+                            ui.label("Scopes (optional, separated by spaces)");
+                            ui.text_edit_singleline(&mut oauth.scopes);
+                            ui.horizontal(|ui| {
+                                if ui.button("Save and sign in").clicked() { oauth_action = Some((name.clone(), false)); }
+                                if ui.button("Sign out").clicked() { oauth_action = Some((name.clone(), true)); }
+                            });
+                            ui.weak("Tokens are stored in the OS credential store. Sign out removes local tokens; revoke access at the provider to revoke the grant.");
+                        } else {
+                        ui.label("Bearer token environment variable (optional)");
+                        let mut token = bearer_token_env.clone().unwrap_or_default();
+                        if ui.text_edit_singleline(&mut token).changed() {
+                            *bearer_token_env = if token.is_empty() { None } else { Some(token) };
+                        }
+                        }
+                    }
+                }
+            });
+        });
+    }
+    if let Some(name) = remove {
+        config.servers.remove(&name);
+    }
+    ui.horizontal(|ui| {
+        ui.add(egui::TextEdit::singleline(new_server).hint_text("New server name"));
+        let valid = !new_server.is_empty()
+            && new_server.len() <= 64
+            && new_server
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+            && !config.servers.contains_key(new_server);
+        if ui
+            .add_enabled(valid, egui::Button::new("Add MCP server"))
+            .clicked()
+        {
+            config.servers.insert(
+                std::mem::take(new_server),
+                Server::Stdio {
+                    command: String::new(),
+                    args: vec![],
+                    cwd: None,
+                    env_from: Default::default(),
+                },
+            );
+        }
+    });
+    ui.weak("Use a unique name containing letters, numbers, hyphens or underscores.");
+    ui.separator();
+    ui.label("Skills");
+    ui.weak("Add a skill folder containing SKILL.md, or a directory of skills. Removing a path stops discovery there; files stay on disk.");
+    let mut remove = None;
+    for (index, path) in config.skill_directories.iter().enumerate() {
+        ui.push_id(("skill", index), |ui| {
+            ui.horizontal(|ui| {
+                ui.label(path.display().to_string());
+                if ui.button("Remove skill path").clicked() {
+                    remove = Some(index);
+                }
+            });
+        });
+    }
+    if let Some(index) = remove {
+        config.skill_directories.remove(index);
+    }
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::TextEdit::singleline(new_skill_directory)
+                .hint_text("~/.agents/skills or a specific skill folder"),
+        );
+        let path = PathBuf::from(new_skill_directory.trim());
+        if ui
+            .add_enabled(
+                !new_skill_directory.trim().is_empty() && !config.skill_directories.contains(&path),
+                egui::Button::new("Add skill path"),
+            )
+            .clicked()
+        {
+            config.skill_directories.push(path);
+            new_skill_directory.clear();
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.label("Tool timeout (seconds)");
+        ui.add(egui::DragValue::new(&mut config.timeout_seconds).range(1..=600));
+    });
+    (valid, oauth_action)
 }

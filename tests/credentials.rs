@@ -53,6 +53,7 @@ async fn saved_keys_reload_and_failed_replacement_preserves_active_key() {
     let (events_tx, mut events) = mpsc::unbounded_channel();
     let worker = tokio::spawn(runtime::run(
         Settings {
+            integrations_path: None,
             provider: Provider::DeepSeek,
             directory: directory.path().into(),
             master: "fixture".into(),
@@ -72,6 +73,18 @@ async fn saved_keys_reload_and_failed_replacement_preserves_active_key() {
     };
     tx.send(apply("fixture-new")).unwrap();
     wait(&mut events, true).await;
+    let saved = runtime::ModelSelection::load(directory.path())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(saved.provider, Provider::DeepSeek);
+    assert_eq!(saved.master, "fixture");
+    assert_eq!(saved.compactor, "fixture");
+    assert!(
+        !std::fs::read_to_string(directory.path().join("settings.json"))
+            .unwrap()
+            .contains("fixture-new")
+    );
     assert_eq!(
         credentials::load(Provider::DeepSeek).await.unwrap(),
         "fixture-new"
@@ -82,6 +95,29 @@ async fn saved_keys_reload_and_failed_replacement_preserves_active_key() {
     mock.set_error(keyring_core::Error::NoEntry);
     tx.send(apply("fixture-rejected")).unwrap();
     wait(&mut events, false).await;
+    assert_eq!(
+        runtime::ModelSelection::load(directory.path())
+            .await
+            .unwrap(),
+        Some(saved.clone())
+    );
+
+    // A persistence failure must reject the selection and retain the active client.
+    std::fs::create_dir(directory.path().join("settings.json.tmp")).unwrap();
+    tx.send(Command::Models {
+        provider: Provider::Anthropic,
+        master: "should-not-apply".into(),
+        compactor: "should-not-apply".into(),
+        api_key: None,
+    })
+    .unwrap();
+    wait(&mut events, false).await;
+    assert_eq!(
+        runtime::ModelSelection::load(directory.path())
+            .await
+            .unwrap(),
+        Some(saved)
+    );
     assert_eq!(
         credentials::load(Provider::DeepSeek).await.unwrap(),
         "fixture-new"
@@ -105,6 +141,39 @@ async fn saved_keys_reload_and_failed_replacement_preserves_active_key() {
     let request = server.join().unwrap();
     assert!(request.contains("x-api-key: fixture-new\r\n"));
     assert!(!request.contains("fixture-rejected"));
+}
+
+#[tokio::test]
+async fn model_selection_round_trip_and_invalid_file() {
+    let directory = tempfile::tempdir().unwrap();
+    assert_eq!(
+        runtime::ModelSelection::load(directory.path())
+            .await
+            .unwrap(),
+        None
+    );
+    for provider in [Provider::DeepSeek, Provider::Anthropic] {
+        let selection = runtime::ModelSelection {
+            provider,
+            master: "custom-master".into(),
+            compactor: "custom-compactor".into(),
+        };
+        selection.save(directory.path()).await.unwrap();
+        assert_eq!(
+            runtime::ModelSelection::load(directory.path())
+                .await
+                .unwrap(),
+            Some(selection)
+        );
+    }
+    tokio::fs::write(directory.path().join("settings.json"), b"broken")
+        .await
+        .unwrap();
+    assert!(
+        runtime::ModelSelection::load(directory.path())
+            .await
+            .is_err()
+    );
 }
 
 async fn wait(events: &mut mpsc::UnboundedReceiver<Event>, success: bool) {

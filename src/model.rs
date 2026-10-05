@@ -3,7 +3,8 @@ use futures_util::StreamExt;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Provider {
     Anthropic,
     DeepSeek,
@@ -84,6 +85,7 @@ pub struct Client {
     key: String,
     endpoint: String,
     provider: Provider,
+    max_output_tokens: u32,
 }
 #[derive(Debug)]
 pub enum StreamEvent {
@@ -111,6 +113,7 @@ impl Client {
             key,
             endpoint,
             provider,
+            max_output_tokens: 8192,
         }
     }
     pub async fn ask(
@@ -128,7 +131,7 @@ impl Client {
                 self.provider.label()
             )));
         }
-        let mut body = json!({"model":model,"max_tokens":8192,"system":system,"messages":messages,"stream":true,"thinking":{"type":"adaptive"},"output_config":{"effort":"medium"},"cache_control":{"type":"ephemeral"}});
+        let mut body = json!({"model":model,"max_tokens":self.max_output_tokens,"system":system,"messages":messages,"stream":true,"thinking":{"type":"adaptive"},"output_config":{"effort":"medium"},"cache_control":{"type":"ephemeral"}});
         if !tools.is_empty() {
             body["tools"] = json!(tools);
         }
@@ -289,8 +292,14 @@ impl Client {
         blocks.push(json!({"type":"text","text":format!("For scale, this line is exactly 512 bytes:\n{}\n\n{instruction}\n{source}", scale())}));
         let mut messages = vec![json!({"role":"user","content":blocks})];
         let mut shortest: Option<String> = None;
+        // Leave room for reasoning before the model emits the short summary.
+        let mut compactor = self.clone();
+        compactor.max_output_tokens = match self.provider {
+            Provider::DeepSeek => 384_000,
+            Provider::Anthropic => 32_768,
+        };
         for _ in 0..TRIES {
-            let response = self
+            let response = compactor
                 .ask(model, include_str!("compact.txt"), &messages, &[], None)
                 .await?;
             let line = response
@@ -302,7 +311,16 @@ impl Client {
                 .trim()
                 .to_owned();
             if line.is_empty() {
-                return Err(Error::Invalid("Compactor returned an empty summary".into()));
+                return Err(Error::Invalid(format!(
+                    "Compactor returned no summary text (stop reason: {}; output tokens: {:?}; thinking blocks: {})",
+                    response.stop,
+                    response.usage.output,
+                    response
+                        .content
+                        .iter()
+                        .filter(|block| block["type"] == "thinking")
+                        .count()
+                )));
             }
             if shortest.as_ref().is_none_or(|s| line.len() < s.len()) {
                 shortest = Some(line.clone());
