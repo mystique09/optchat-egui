@@ -44,13 +44,58 @@ Without a key, history browsing, export, import, and free summaries work. Model 
 | `OPTCHAT_INSTRUCTIONS` | `AGENTS.md` in the launch directory, if present |
 | `OPTCHAT_ENDPOINT` | `https://api.anthropic.com/v1/messages` or `https://api.deepseek.com/anthropic/v1/messages` |
 
-Anthropic uses adaptive thinking and medium effort. DeepSeek uses enabled thinking and high effort (DeepSeek maps medium to high). Choose models supporting these options. Settings lets you select a provider and change both models between turns; selecting a provider fills its model defaults, and **Save and apply** activates the selection and any new key without a restart. Provider and model selections remain session-only; launch environment overrides still work. Background compaction already in flight completes with its original provider and key; subsequent requests use the updated settings.
+Anthropic uses adaptive thinking and medium effort. DeepSeek uses enabled thinking and high effort (DeepSeek maps medium to high). Choose models supporting these options. Settings lets you select a provider and change both models between turns; selecting a provider fills its model defaults, and **Save and apply** activates the selection and any new key without a restart. The selected provider and both model names persist in `chat/settings.json` and reload on startup; API keys remain in the OS credential store. Explicit launch environment variables override saved selections. Overriding the provider uses that provider's default models unless it matches the saved provider or model environment overrides are supplied. Background compaction already in flight completes with its original provider and key; subsequent requests use the updated settings.
+
+Background compaction allows 384,000 output tokens for DeepSeek and 32,768 for Anthropic, giving reasoning room before the short summary. DeepSeek retains enabled, high-effort thinking; Anthropic retains adaptive, medium-effort thinking. Chat requests keep their 8,192-token output limit. The summary target remains 512 bytes. These are output ceilings, not guaranteed completion lengths; the existing five-minute request timeout still applies.
 
 The endpoint override is intended for a trusted compatible gateway or local testing; requests include your API key. Switching providers in Settings resets the endpoint to that provider's official URL. Changing only model names preserves the current endpoint.
 
 Send with the button or Command+Enter. Messages submitted during a tool loop arrive at its next tool boundary; messages arriving after the last boundary start another fresh turn. Stop preserves waiting input in the log without generating a reply. Closing the window gracefully drains completed entries and saves pending input.
 
 Memory shows the current view. Select a range to inspect its two children, then drill down to the verbatim message. Settings can export a standalone HTML page with the view, all messages, and every tree level, including ranges, timestamps, and byte sizes. Import accepts UTF-8 text, one non-empty line per `note`, appended with new global IDs. Imports are permanent and intentionally not deduplicated.
+
+## Local tools, MCP and skills
+
+Drop PNG, JPEG, GIF, WebP, or UTF-8 text/log files into the chat. Review the attachment list, remove unwanted files, and send with an optional message. Images are sent as image content blocks; logs are sent as text. Use a vision-capable model (DeepSeek: `deepseek-flash`). Limits: 8 files, 5 MiB per file, 20 MiB combined, and 256 KiB combined text per message. Originals are copied into `chat/attachments`; memory retains their saved paths and log text, plus the assistant's analysis. Image bytes are sent in the attaching turn, not embedded into the text summary tree or HTML export. Include the attachments directory when backing up history.
+
+The assistant can edit the integrations file with local tools. Valid changes reload after its tool batch, before the next model step; external edits also reload while idle. Settings saves merge unrelated disk changes and reject edits that conflict with changes to the same server or setting. **Reload from disk (discard Settings edits)** refreshes the editor explicitly. OAuth sign-in uses the merged configuration and still requires browser authorization.
+
+The model has built-in `shell`, `read_file`, `write_file`, and `list_directory` tools. Local calls use the same persisted **Ask for approval / Full access** setting as MCP calls. Shell uses `/bin/sh` with an explicit absolute working directory, bounded output, and a configurable 1–600 second timeout (60 by default). Stop or timeout terminates its process group. File paths must be absolute or start with `~/`; reads are paged UTF-8 and replacing an existing file requires `overwrite: true`. Parent directories must already exist. These tools have the macOS permissions of OptChat, so skills can now run their scripts through shell when approved.
+
+Open **Settings → MCP and skills**. Use **Add MCP server**, choose Local command (stdio) or Streamable HTTP, and fill in its fields. Arguments have individual fields; environment references use `CHILD_VARIABLE=APP_VARIABLE`, one per line. Use **Add skill path** for a folder containing `SKILL.md` or a directory of skills (default: `~/.agents/skills`). Each server and skill path has a Remove button; removal leaves files on disk. Click **Save and reload integrations** while idle to apply additions, edits, and removals. Settings are saved to `chat/integrations.json`; saving launches configured stdio commands. Connections and tools refresh on reload, and the tool catalog stays unchanged within a turn. A failed server does not disable other servers.
+
+Example (replace paths and URL with your server's documented values):
+
+```json
+{
+  "skill_directories": ["~/.agents/skills"],
+  "timeout_seconds": 60,
+  "servers": {
+    "local": {
+      "transport": "stdio",
+      "command": "/absolute/path/to/mcp-server",
+      "args": [],
+      "cwd": "/absolute/path/to/project",
+      "env_from": {"SERVICE_TOKEN": "MY_SERVICE_TOKEN"}
+    },
+    "remote": {
+      "transport": "http",
+      "url": "https://your-server.example/mcp",
+      "bearer_token_env": "MY_MCP_TOKEN"
+    }
+  }
+}
+```
+
+`env_from` maps each child variable to a variable in OptChat's launch environment. Stdio inherits only PATH, HOME, USER, TMPDIR, LANG and SYSTEMROOT unless explicitly mapped. HTTP bearer tokens are also read from the launch environment; omit `bearer_token_env` for unauthenticated servers. Finder-launched apps may not inherit shell variables or package-manager PATH entries; use absolute executable paths. Configuration does not store token values.
+
+Send `/permissions` or click **Permissions** to choose **Ask for approval** (default) or **Full access**. The choice persists in `chat/permissions.json`. Ask shows each MCP call's server, tool name, and arguments with **Allow once** and **Deny**. Full access runs all configured MCP tools without prompts, including tools that change files or external services. Choosing Full access also approves a currently pending call. You can return to Ask at any time; calls already running are not undone. **Stop** cancels approval or requests cancellation of the active call. A canceled remote operation may already have had side effects; OptChat does not automatically retry tool calls. Reload integrations after a disconnected or expired session. Tool results and errors enter the normal memory log. Text, embedded text resources, resource links, and structured results are represented as text; images/audio are identified but not passed to the model as media.
+
+Skill discovery defaults to `~/.agents/skills`, including nested and symlinked directories. The model sees names/descriptions and can use `load_skill` and `read_skill_file` to read instructions and relative references. Large UTF-8 files are paged; references cannot escape the skill directory. Skills do not grant permission, execute scripts automatically, or install missing tools. Reload after changing skills. Duplicate names have distinct IDs derived from their directory paths.
+
+For an HTTP server requiring OAuth, enable **Browser sign-in (OAuth)** and click **Save and sign in**. Complete the provider's authorization in your browser; OptChat reconnects when it finishes. Leave Client ID blank for dynamic registration, or supply a preregistered public client ID. Optional scopes are space-separated; otherwise the SDK selects them from the server's challenge/metadata. The loopback callback uses an available local port. Sign-in can be canceled and expires after five minutes. Tokens and refresh tokens are stored in the OS credential store, bound to the server URL and client ID, and restored on restart. Refresh is automatic; revoked grants require signing in again. **Sign out** deletes local credentials and disconnects the current OAuth integration on reload; revoke the grant at the provider to invalidate it remotely. OAuth requires HTTPS except for loopback test servers.
+
+This is a general MCP **tools client** using the official Rust SDK over stdio and Streamable HTTP. OAuth supports discovery, authorization code with PKCE, dynamic registration or a preregistered public client, and token refresh. Hosted client metadata documents, confidential clients requiring client secrets, automatic scope-upgrade dialogs, deprecated standalone SSE transport, MCP resources/prompts discovery, sampling, elicitation, roots, and task extensions are not implemented or advertised. On an authorization rejection, the SDK may refresh and resend once; other failed tool calls are not automatically retried. See the [local PRD](docs/prds/mcp-and-skills.md) for acceptance criteria.
 
 ## Spec behavior
 
@@ -68,7 +113,7 @@ Memory shows the current view. Select a range to inspect its two children, then 
 
 ## Explicit scope choices
 
-The requested egui desktop interface replaces the spec's plain terminal interface. It runs locally while the app is open; remote attachment and an always-on server are not included. Providers are Anthropic and DeepSeek; OpenAI-specific transport is not implemented. The model has the memory tools, not shell, filesystem execution, web, or computer-use tools. Optional subagents are omitted. Files are durable after each entry; automatic Git commits and remote backups are not performed. Back up the complete chat directory yourself.
+The requested egui desktop interface replaces the spec's plain terminal interface. It runs locally while the app is open; remote attachment and an always-on server are not included. Providers are Anthropic and DeepSeek; OpenAI-specific transport is not implemented. The model has memory, skill, local shell/file tools and tools from explicitly configured MCP servers. Dedicated browser tools require a suitable server. Optional subagents are omitted. Files are durable after each entry; automatic Git commits and remote backups are not performed. Back up the complete chat directory yourself.
 
 These are not claims of perfect recall: summaries can omit retrieval clues even though original text remains intact. Live model summary quality and actual vendor cache-hit rates require testing with your credentials. Local fixtures verify transport, request layout, tool continuity, and storage behavior without paid calls.
 
@@ -85,3 +130,5 @@ Tests cover durable reloads, locking, torn tails, write failures, ordered tree c
 Provider tests exercise both Anthropic and DeepSeek request policies, streamed tool loops, compaction retries, missing-key errors, and usage reporting through local HTTP fixtures. They do not establish live provider compatibility or summary quality.
 
 Credential tests use an isolated in-memory store to verify reloads, provider isolation, failed replacements, and the key sent on subsequent requests. The optional `cargo test --locked native_store_round_trip -- --ignored` checks the OS credential store with disposable test entries and removes them afterward.
+
+MCP integration tests require `python3` for a local protocol fixture. They exercise stdio, Streamable HTTP JSON/SSE, pagination, multiple servers, approval, timeout/cancellation, and the model loop without external accounts. `cargo test --locked installed_skill_catalog -- --ignored --nocapture` checks the locally installed skills read-only.

@@ -4,6 +4,8 @@ Audited 2026-10-05 against [Victor Taelin's specification](https://gist.github.c
 
 ## Result
 
+Update: MCP tools and local skills are now implemented; see [the integration PRD](docs/prds/mcp-and-skills.md). The original audit below records the earlier baseline. General tools are now available through configured MCP servers, with per-call approval; remote operation, session importing, and backup remain separate gaps.
+
 The core memory architecture follows the specification. This is not a complete implementation of every operational feature in the document. The native egui interface and DeepSeek provider are requested adaptations. Remote operation, general agent tools, historical session importing, and automated backup remain absent. Live provider behavior has not been verified with paid requests.
 
 The audit found and fixed missing metadata in the HTML export's current-view section: each view entry now includes its range, byte size, and time span, alongside the original rendered view. A regression test failed before the fix and passes afterward.
